@@ -1,60 +1,38 @@
-import requests
+from playwright.sync_api import sync_playwright
 import boto3
 import uuid
 
 def lambda_handler(event, context):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox"], headless=True)
+        page = browser.new_page()
 
-    url = "https://ultimosismo.igp.gob.pe/api/sismos/reportados?year=2025"
+        page.goto("https://ultimosismo.igp.gob.pe/ultimo-sismo/sismos-reportados", wait_until="networkidle")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Referer": "https://ultimosismo.igp.gob.pe/"
-    }
+        # extract table rows after Angular renders
+        rows = page.query_selector_all("table tbody tr")
 
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-    except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": f"Error en conexión: {str(e)}"
-        }
+        extracted = []
 
-    if response.status_code != 200:
-        return {
-            "statusCode": response.status_code,
-            "body": "No se pudo acceder al API del IGP"
-        }
+        for r in rows[:10]:
+            cols = r.query_selector_all("td")
+            extracted.append({
+                "id": str(uuid.uuid4()),
+                "reporte": cols[0].inner_text().strip(),
+                "referencia": cols[1].inner_text().strip(),
+                "fecha_hora": cols[2].inner_text().strip(),
+                "magnitud": cols[3].inner_text().strip(),
+                "link": cols[4].query_selector("a").get_attribute("href")
+            })
 
-    data = response.json()
-    sismos = data.get("data", [])
+        browser.close()
 
-    ultimos_10 = sismos[:10]
-
-    cleaned = []
-    for s in ultimos_10:
-        cleaned.append({
-            "id": str(uuid.uuid4()),
-            "reporte": s.get("reporte_sismico"),
-            "referencia": s.get("referencia"),
-            "fecha_hora": s.get("fecha_local"),
-            "magnitud": str(s.get("magnitud")),
-            "enlace": "https://ultimosismo.igp.gob.pe/evento/" + s.get("codigo")
-        })
-
-    dynamodb = boto3.resource("dynamodb")
-    table = dynamodb.Table("TablaSismosIGP")
-
-    scan = table.scan()
-    with table.batch_writer() as batch:
-        for item in scan.get("Items", []):
-            batch.delete_item(Key={"id": item["id"]})
+    # Save to DynamoDB
+    dynamo = boto3.resource("dynamodb")
+    table = dynamo.Table("TablaSismosIGP")
 
     with table.batch_writer() as batch:
-        for item in cleaned:
+        for item in extracted:
             batch.put_item(Item=item)
 
-    return {
-        "statusCode": 200,
-        "body": cleaned
-    }
+    return {"statusCode": 200, "body": extracted}
